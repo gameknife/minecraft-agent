@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Bedrock-OSS/regolith-schemas/main/config/v1.2.json",
+  "author": "MC_AGENT",
+  "name": "MC_AGENT",
+  "packs": {
+    "behaviorPack": "./packs/BP",
+    "resourcePack": "./packs/RP"
+  },
+  "regolith": {
+    "dataPath": "./data",
+    "filterDefinitions": {
+      "ts_compiler": {
+        "runWith": "nodejs",
+        "script": "./data/ts_compiler/compiler.js"
+      }
+    },
+    "profiles": {
+      "default": {
+        "export": {
+          "readOnly": false,
+          "target": "development"
+        },
+        "filters": [
+          { "filter": "ts_compiler" }
+        ]
+      }
+    }
+  }
+}
