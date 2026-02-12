@@ -2,8 +2,6 @@
 
 Minecraft Bedrock Edition AI 建造助手 —— 在聊天框输入自然语言，AI 帮你搭建筑。
 
-https://github.com/user-attachments/assets/placeholder
-
 ## How It Works
 
 ```
@@ -43,9 +41,9 @@ Node.js Server
 cd server
 npm install
 
-# 行为包编译 filter
-cd ../data/ts_compiler
-npm install
+# 行为包准备
+cd ../
+regolith install-all
 ```
 
 ### 2. 配置环境变量
@@ -81,7 +79,7 @@ npx tsx src/index.ts
 ### 5. 游戏内连接
 
 ```
-/wsserver ws://localhost:8000
+/connect localhost:8000
 ```
 
 然后在聊天框输入：
@@ -117,7 +115,7 @@ MC_AGENT/
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `GEMINI_API_KEY` | *(必填)* | Gemini API 密钥 |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini 模型 |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini 模型 |
 | `PORT` | `8000` | WebSocket 服务端口 |
 | `CHUNK_SIZE` | `5` | 每个 scriptevent 包含的方块数 |
 
