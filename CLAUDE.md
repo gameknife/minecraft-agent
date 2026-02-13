@@ -1,68 +1,139 @@
-# MC_AGENT - Claude Code 项目指南
+# CLAUDE.md
 
-## 项目概述
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Minecraft 基岩版 x LLM 智能建造助手。玩家在聊天中输入 `!ai <描述>`，通过 Gemini API 生成建造蓝图，行为包逐方块放置。
+## Project Overview
 
-架构：Node.js WebSocket Server ← `/wsserver` → Minecraft 客户端 → 行为包 Script API
+Minecraft Bedrock Edition x LLM building assistant. Players type `!ai <description>` in chat, the server calls Gemini API to generate a block blueprint, then sends it to the behavior pack which places blocks tick-by-tick.
 
-## 目录结构
+Architecture: `Node.js WS Server` ← `/wsserver` → `Minecraft Client` → `Behavior Pack Script API`
 
-```
-MC_AGENT/
-├── server/                # Node.js 服务端 (TypeScript, tsx 直接运行)
-│   ├── src/
-│   │   ├── index.ts       # 入口：WS Server + 流程编排
-│   │   ├── ws-handler.ts  # Minecraft WS 协议处理
-│   │   └── gemini.ts      # Gemini API 集成
-│   ├── logs/              # 每轮构建的 md 日志 (gitignored)
-│   └── .env               # 配置 (gitignored)
-├── packs/
-│   ├── BP/
-│   │   ├── manifest.json  # @minecraft/server 1.16.0
-│   │   └── scripts/
-│   │       └── main.ts    # scriptevent 监听 + runJob 放置
-│   └── RP/
-├── data/
-│   └── ts_compiler/       # 本地 Regolith filter (esbuild)
-│       ├── compiler.js
-│       └── package.json
-└── config.json            # Regolith 配置
+## Build & Run Commands
+
+```bash
+# Install server dependencies
+cd server && npm install
+
+# Start server (one-shot)
+cd server && npx tsx src/index.ts
+
+# Start server (watch mode, auto-restart on changes)
+cd server && npm run dev
+
+# Build behavior pack (compiles TS → JS, deploys to com.mojang)
+regolith run
+
+# In-game: connect then build
+/wsserver ws://localhost:8000
+!ai a stone hut
 ```
 
-## 构建与运行
+Prerequisites: Node.js >= 18, [Regolith](https://bedrock-oss.github.io/regolith/), Minecraft Bedrock (cheats enabled), Gemini API key.
 
-- 服务端：`cd server && npx tsx src/index.ts`
-- 行为包：`regolith run`（输出到 com.mojang/development_behavior_packs/）
-- 游戏内：`/wsserver ws://localhost:8000`，然后 `!ai <描述>`
+## Architecture
 
-## 关键经验（踩坑记录）
+### Data Flow
+
+1. Player sends `!ai <prompt>` → server receives `PlayerMessage` event via WS
+2. Server queries player position via `/querytarget`
+3. Server gets or creates a per-player **session** (locks origin on first call)
+4. Server sends `ai:scan` scriptevent → BP scans nearby blocks → BP sends results back via `world.sendMessage("__SCAN__:...")` → server intercepts and parses
+5. Server formats terrain context + player relative position + build history into a **Chat API** message
+6. Gemini returns either **compact program** (defs/steps with for-loops and function calls) or **legacy flat blocks array**
+7. Server expands compact program into flat `Block[]`, validates block types against `minecraft-data` catalog
+8. Server chunks blocks (default 5 per `/scriptevent`) and sends `ai:build` events with 150ms delays using **session origin** (not current player position)
+9. Behavior pack receives chunks, uses `system.runJob` generator to place one block per tick
+
+### Server (`server/src/`)
+
+- **`index.ts`** — Entry point. WS server setup, `PlayerMessage` listener, build orchestration with session lifecycle, terrain scanning, Chat API integration, `!ai reset/status` commands, round logging (success logs to `server/logs/`, failures to `server/logs/failed/`). Loads block catalog from `minecraft-data` using BP manifest's `min_engine_version`.
+- **`ws-handler.ts`** — `MinecraftHandler` class wrapping the Minecraft WS protocol. Handles command request/response correlation via UUIDs, event subscriptions, `/querytarget` parsing, `/scriptevent` chunking, `/tellraw` messaging, terrain scan command/collection (`ai:scan` + `__SCAN__` message interception).
+- **`gemini.ts`** — Gemini API integration. Supports both stateless `generateBlueprint()` and multi-turn `createChatSession()` + `sendChatMessage()`. Builds system prompt with compact DSL spec + block palette + terrain context. Contains `formatTerrainContext()` for scan data formatting. Full expression parser/evaluator for compact program format.
+- **`session.ts`** — `SessionManager` class. Per-player sessions with locked origin, Chat object, build history, and auto-expiry.
+
+### Compact Blueprint DSL (in `gemini.ts`)
+
+Gemini can return a mini-program instead of flat block lists. The server-side interpreter supports:
+- `place`/`block` ops with coordinate expressions
+- `for` loops with variable binding, from/to/step
+- `call` to named functions defined in `defs` with parameter passing
+- Arithmetic expressions: `"y+1"`, `"(x+z)/2"`, variable references
+- Safety limits: MAX_BLOCKS=10000, MAX_EXECUTED_STEPS=50000, MAX_CALL_DEPTH=24, MAX_CALLS=500
+
+### Behavior Pack (`packs/BP/scripts/main.ts`)
+
+Single file. Handles two scriptevents:
+- `ai:build` — parses JSON payload, uses `system.runJob` generator to place blocks one-per-tick via `block.setType()`. Tracks multi-chunk build progress.
+- `ai:scan` — scans a 3D region around a center point, filters air blocks, sends non-air block data back to server via `world.sendMessage("§8__SCAN__:...")` in chunks of 50 blocks.
+
+### Regolith Build (`data/ts_compiler/`)
+
+Local esbuild filter (`runWith: "nodejs"`). Compiles `main.ts` → `main.js` (ESM, es2020 target), externalizes `@minecraft/server`, strips `.ts` files from output.
+
+## Critical Pitfalls
+
+### Minecraft WS Protocol
+- `/querytarget` `statusMessage` has a **localized prefix** (Chinese: `"目标数据：[...]"`). Must extract JSON from first `[` character, not parse the whole string.
+- `/querytarget` position is nested: `targets[0].position.x`, NOT `targets[0].x`.
+- `PlayerMessage` events must filter `type === "chat"` — `tellraw` echoes also fire this event, causing infinite loops.
+
+### scriptevent Chunking
+- `/scriptevent` has a message length limit. Large JSON payloads get truncated, causing `JSON.parse` crashes in the behavior pack.
+- Keep `CHUNK_SIZE` small (default 5, ~400-500 chars per chunk). 150ms delay between chunks.
+
+### Behavior Pack Script API
+- Use `block.setType(blockType)` — NOT `BlockPermutation.resolve()` + `setPermutation()`. More robust for invalid block names.
+- Generator errors inside `system.runJob` crash the script engine. Always try/catch inside generators.
+- `system.afterEvents.scriptEventReceive.subscribe` — don't pass options object, filter `event.id` manually in callback.
 
 ### Regolith
-- **不要用远程 `system_template_esbuild` filter**，用本地 `ts_compiler` filter（`runWith: "nodejs"`）
-- TS 源码放在 `packs/BP/scripts/main.ts`，compiler.js 编译后输出 main.js 到同目录
-- `dataPath` 是 `"./data"`，filter 脚本路径相对于项目根目录
+- Use local `ts_compiler` filter, NOT remote `system_template_esbuild`.
+- TS source lives at `packs/BP/scripts/main.ts`; compiled output replaces it in the build.
 
-### Minecraft WS 协议
-- `/querytarget` 的 `statusMessage` 带本地化前缀（中文版为 `"目标数据：[...]"`），必须用 `indexOf("[")` 提取 JSON 部分再 parse
-- `/querytarget` 返回的坐标在 `position` 子对象内：`targets[0].position.x`，不是顶层 `targets[0].x`
-- `PlayerMessage` 事件需过滤 `type === "chat"`，否则 tellraw 回显会触发无限循环
+## Configuration (.env)
 
-### scriptevent 分块
-- `/scriptevent` 消息有长度限制，大 JSON 会截断导致行为包 JSON.parse 崩溃
-- 默认 CHUNK_SIZE=5（通过 .env 配置），每块约 400-500 字符，安全范围内
-- 分块间 150ms 延迟，避免客户端过载
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | *(required)* | Gemini API key |
+| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model name |
+| `PORT` | `8000` | WS server port |
+| `CHUNK_SIZE` | `5` | Blocks per scriptevent chunk |
+| `PROMPT_BLOCK_TYPE_LIMIT` | `0` | Max block types in system prompt; `0` = no limit |
+| `MINECRAFT_DATA_VERSION` | *(auto from manifest)* | Override minecraft-data version lookup |
+| `SCAN_RADIUS` | `8` | Horizontal scan radius (blocks) |
+| `SCAN_Y_BELOW` | `3` | Scan depth below player feet |
+| `SCAN_Y_ABOVE` | `10` | Scan height above player feet |
+| `SCAN_MAX_BLOCKS` | `500` | Max non-air blocks in terrain context |
+| `SCAN_TIMEOUT` | `15000` | Scan timeout (ms) |
+| `SESSION_TIMEOUT` | `1800000` | Session inactivity timeout (30min, ms) |
+| `ORIGIN_DRIFT_THRESHOLD` | `100` | Distance warning threshold (blocks) |
 
-### 行为包 Script API
-- 用 `block.setType(blockType)` 而非 `BlockPermutation.resolve()` + `setPermutation()`，前者对无效方块名更健壮
-- generator 内的异常必须 try/catch，否则 `system.runJob` 会导致脚本引擎崩溃
-- `system.afterEvents.scriptEventReceive.subscribe` 不传 options 参数，手动在回调内判断 `event.id`
+## In-Game Commands
 
-## 配置项 (.env)
+- `!ai <prompt>` — Build something. Creates a session on first use, subsequent calls are multi-turn.
+- `!ai reset` — Reset session. Clears conversation history, next build starts fresh at current position.
+- `!ai status` — Show session info (origin, build count, idle time).
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| GEMINI_API_KEY | (必填) | Gemini API 密钥 |
-| GEMINI_MODEL | gemini-2.0-flash | 模型名 |
-| PORT | 8000 | WS 服务端口 |
-| CHUNK_SIZE | 5 | scriptevent 每块方块数 |
+## Session & Coordinate System
+
+- **Session origin** is locked to the player's position on the first `!ai` call.
+- All LLM coordinates are relative to the session origin, so follow-up builds ("add a door", "extend the wall") reference the same coordinate space.
+- `sendBuildCommand` uses session origin, not the player's current position.
+- If the player moves > `ORIGIN_DRIFT_THRESHOLD` blocks, they get a warning to `!ai reset`.
+- Sessions auto-expire after `SESSION_TIMEOUT` (default 30 min) of inactivity.
+- All sessions are cleared on WS disconnect.
+
+## Terrain Scanning
+
+- BP scans a region around the player: `(2*SCAN_RADIUS+1) × (SCAN_Y_BELOW+SCAN_Y_ABOVE+1) × (2*SCAN_RADIUS+1)` blocks.
+- Non-air blocks are sent back via `world.sendMessage()` (visible in chat as dark gray `§8` text).
+- Server intercepts `__SCAN__:` prefixed messages in `handleMessage()` before they reach external listeners.
+- Terrain context is included in the system prompt (new session) or prepended to user message (existing session).
+
+## Conventions
+
+- Server code is TypeScript, run directly via `tsx` (no separate compile step).
+- Behavior pack code is TypeScript, compiled by Regolith's local esbuild filter.
+- Configurable values go in `.env`, not hardcoded.
+- Each build round is logged as a Markdown file in `server/logs/` for manual review.
+- Communication in Chinese, code in English.

@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import type { Chat } from "@google/genai";
 import type { Blueprint, Block } from "./ws-handler.js";
 
 const MAX_BLOCKS = 10_000;
@@ -85,6 +86,19 @@ Rules:
 - Prefer defs + loops + calls instead of listing one block per line when possible.
 - if blockType is minecraft:air, skip it
 - If you cannot satisfy all requirements, still return valid JSON with a smaller build.`;
+
+const MULTI_TURN_PROMPT_ADDITIONS = `
+
+Coordinate system:
+- All coordinates are relative to the session origin (the player's position when the session started).
+- The player's current relative position is provided in each message.
+- When the player says "here", build around their current position.
+- When modifying previous builds, use the same coordinate system as before.
+
+Multi-turn building:
+- You may receive follow-up instructions referring to previous builds.
+- Each response must be a complete, valid JSON blueprint.
+- To remove blocks, place "minecraft:air" at those coordinates.`;
 
 let client: GoogleGenAI | null = null;
 let modelName = "gemini-2.0-flash";
@@ -234,6 +248,102 @@ export async function generateBlueprint(prompt: string): Promise<GeminiResult> {
     );
   }
 }
+
+// -- Chat API (multi-turn) ---------------------------------------------------
+
+export interface ChatSessionResult {
+  chat: Chat;
+  systemPrompt: string;
+}
+
+export function createChatSession(): ChatSessionResult {
+  if (!client) throw new Error("Gemini not initialized – call initGemini()");
+
+  const systemPrompt = buildSystemPrompt();
+  const chat = client.chats.create({
+    model: modelName,
+    config: {
+      systemInstruction: systemPrompt,
+      responseMimeType: "application/json",
+    },
+  });
+  return { chat, systemPrompt };
+}
+
+export async function sendChatMessage(
+  chat: Chat,
+  userMessage: string,
+  systemPrompt: string,
+): Promise<GeminiResult> {
+  let text: string | undefined;
+
+  try {
+    // Do NOT pass per-message config here — it would replace the session
+    // config entirely, losing systemInstruction. The chat was already
+    // created with responseMimeType: "application/json".
+    const response = await chat.sendMessage({ message: userMessage });
+
+    text = response.text;
+    if (!text) {
+      throw new BlueprintGenerationError("Gemini returned empty response", {
+        phase: "empty_response",
+        prompt: userMessage,
+        systemPrompt,
+      });
+    }
+
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch (err) {
+      throw new BlueprintGenerationError(
+        `Gemini returned invalid JSON: ${(err as Error).message}`,
+        {
+          phase: "invalid_json",
+          prompt: userMessage,
+          systemPrompt,
+          rawResponse: text,
+          cause: err,
+        },
+      );
+    }
+
+    try {
+      const blocks = parseBlocksFromResponse(data);
+      return {
+        blueprint: { blocks },
+        rawResponse: text,
+        systemPrompt,
+      };
+    } catch (err) {
+      throw new BlueprintGenerationError(
+        `Gemini response failed blueprint validation: ${(err as Error).message}`,
+        {
+          phase: "invalid_blueprint",
+          prompt: userMessage,
+          systemPrompt,
+          rawResponse: text,
+          cause: err,
+        },
+      );
+    }
+  } catch (err) {
+    if (err instanceof BlueprintGenerationError) throw err;
+
+    throw new BlueprintGenerationError(
+      `Gemini chat request failed: ${(err as Error).message}`,
+      {
+        phase: "api_request",
+        prompt: userMessage,
+        systemPrompt,
+        rawResponse: text,
+        cause: err,
+      },
+    );
+  }
+}
+
+// -- DSL Interpreter ---------------------------------------------------------
 
 type ScopeValue = number | string;
 type Scope = Record<string, ScopeValue>;
@@ -754,7 +864,7 @@ function pickFallbackBlockType(): string {
 
 function buildSystemPrompt(): string {
   const samplePalette = selectPaletteForPrompt();
-  return `${BASE_SYSTEM_PROMPT}
+  return `${BASE_SYSTEM_PROMPT}${MULTI_TURN_PROMPT_ADDITIONS}
 
 Runtime block catalog constraints:
 - Active block catalog version: ${supportedBlockCatalogVersion} (source: ${supportedBlockCatalogSource}).

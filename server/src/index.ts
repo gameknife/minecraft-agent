@@ -7,9 +7,11 @@ import { MinecraftHandler } from "./ws-handler.js";
 import {
   BlueprintGenerationError,
   initGemini,
-  generateBlueprint,
   setSupportedBlockCatalog,
+  createChatSession,
+  sendChatMessage,
 } from "./gemini.js";
+import { SessionManager } from "./session.js";
 
 // -- Config ------------------------------------------------------------------
 
@@ -17,6 +19,8 @@ const PORT = Number(process.env.PORT) || 8000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE) || 5;
+const SESSION_TIMEOUT = Number(process.env.SESSION_TIMEOUT) || 30 * 60 * 1000;
+const ORIGIN_DRIFT_THRESHOLD = Number(process.env.ORIGIN_DRIFT_THRESHOLD) || 100;
 const LOG_DIR = join(import.meta.dirname, "..", "logs");
 const FAILED_LOG_DIR = join(LOG_DIR, "failed");
 const BP_MANIFEST_PATH = join(import.meta.dirname, "..", "..", "packs", "BP", "manifest.json");
@@ -34,6 +38,11 @@ await mkdir(FAILED_LOG_DIR, { recursive: true });
 
 // Load block catalog from minecraft-data
 await loadBlockCatalogFromMinecraftData();
+
+const sessionManager = new SessionManager(SESSION_TIMEOUT);
+
+// Periodically clean expired sessions
+setInterval(() => sessionManager.cleanExpired(), 60_000);
 
 // -- WebSocket Server --------------------------------------------------------
 
@@ -63,6 +72,23 @@ wss.on("connection", (ws) => {
 
     console.log(`[Chat] ${sender}: !ai ${prompt}`);
 
+    // Handle special commands
+    if (prompt === "reset") {
+      sessionManager.resetSession(sender);
+      mc.tellraw(sender, "§a[AI] Session reset. Next build will start a new session.");
+      return;
+    }
+
+    if (prompt === "status") {
+      const info = sessionManager.getSessionInfo(sender);
+      if (info) {
+        mc.tellraw(sender, `§e[AI] Session: ${info}`);
+      } else {
+        mc.tellraw(sender, "§e[AI] No active session.");
+      }
+      return;
+    }
+
     // Process asynchronously
     handleBuildRequest(mc, sender, prompt).catch((err) => {
       console.error("[Error]", err);
@@ -72,6 +98,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("[Server] Minecraft client disconnected");
+    sessionManager.clearAll();
   });
 
   ws.on("error", (err) => {
@@ -219,21 +246,64 @@ async function handleBuildRequest(
   mc.tellraw(playerName, `§e[AI] Thinking about: "${prompt}" ...`);
 
   // 1. Query player position
-  const pos = await mc.queryPlayerPosition(playerName);
-  console.log(`[Pos] ${playerName} at (${pos.x}, ${pos.y}, ${pos.z})`);
+  const currentPos = await mc.queryPlayerPosition(playerName);
+  console.log(`[Pos] ${playerName} at (${currentPos.x}, ${currentPos.y}, ${currentPos.z})`);
 
-  // 2. Generate blueprint via Gemini
+  // 2. Get or create session
+  let session = sessionManager.getSession(playerName);
+  const isNewSession = !session;
+  const sessionOrigin = session?.origin ?? currentPos;
+
+  if (isNewSession) {
+    const { chat, systemPrompt } = createChatSession();
+    session = sessionManager.createSession(playerName, sessionOrigin, chat, systemPrompt);
+    console.log(`[Session] New session for ${playerName}, origin=(${sessionOrigin.x}, ${sessionOrigin.y}, ${sessionOrigin.z})`);
+  } else {
+    // Check drift
+    const dx = currentPos.x - session!.origin.x;
+    const dz = currentPos.z - session!.origin.z;
+    const drift = Math.sqrt(dx * dx + dz * dz);
+    if (drift > ORIGIN_DRIFT_THRESHOLD) {
+      mc.tellraw(
+        playerName,
+        `§6[AI] Warning: You are ${Math.floor(drift)} blocks from session origin. ` +
+        `Coordinates may be inaccurate. Use "!ai reset" to start a new session at your current location.`,
+      );
+    }
+  }
+
+  // 3. Build user message
   mc.tellraw(playerName, "§e[AI] Generating blueprint...");
 
+  const relativePos = {
+    x: currentPos.x - session!.origin.x,
+    y: currentPos.y - session!.origin.y,
+    z: currentPos.z - session!.origin.z,
+  };
+
+  let userMessage = `Player is currently at relative position (${relativePos.x}, ${relativePos.y}, ${relativePos.z}).`;
+
+  // Include build history summary
+  if (session!.builds.length > 0) {
+    const historyLines = session!.builds.map(
+      (b, i) => `  ${i + 1}. "${b.prompt}" (${b.blockCount} blocks)`,
+    );
+    userMessage += `\n\nPrevious builds in this session:\n${historyLines.join("\n")}`;
+  }
+
+  userMessage += `\n\nRequest: ${prompt}`;
+
+  // 4. Send to Gemini via Chat API
   let result;
   try {
-    result = await generateBlueprint(prompt);
+    result = await sendChatMessage(session!.chat, userMessage, session!.systemPrompt);
   } catch (err) {
     await writeFailedRoundLog({
       playerName,
       prompt,
-      pos,
+      pos: currentPos,
       error: err,
+      userMessage,
     });
     throw err;
   }
@@ -241,15 +311,33 @@ async function handleBuildRequest(
   const { blueprint, rawResponse, systemPrompt } = result;
   console.log(`[Gemini] Generated ${blueprint.blocks.length} blocks`);
 
-  // 3. Write round log
-  await writeRoundLog({ playerName, prompt, pos, systemPrompt, rawResponse, blueprint });
+  // 5. Record build in session
+  session!.builds.push({
+    prompt,
+    blockCount: blueprint.blocks.length,
+    timestamp: Date.now(),
+  });
 
-  // 4. Send build command(s) to behavior pack via scriptevent
+  // 6. Write round log
+  await writeRoundLog({
+    playerName,
+    prompt,
+    userMessage,
+    pos: currentPos,
+    systemPrompt,
+    rawResponse,
+    blueprint,
+    sessionOrigin: session!.origin,
+    isNewSession,
+    buildNumber: session!.builds.length,
+  });
+
+  // 7. Send build command using SESSION ORIGIN (not current pos)
   mc.tellraw(
     playerName,
     `§a[AI] Building ${blueprint.blocks.length} blocks...`,
   );
-  await mc.sendBuildCommand(pos, blueprint, CHUNK_SIZE);
+  await mc.sendBuildCommand(session!.origin, blueprint, CHUNK_SIZE);
 
   console.log("[Build] scriptevent(s) sent");
 }
@@ -259,10 +347,14 @@ async function handleBuildRequest(
 interface RoundLog {
   playerName: string;
   prompt: string;
+  userMessage: string;
   pos: { x: number; y: number; z: number };
   systemPrompt: string;
   rawResponse: string;
   blueprint: { blocks: Array<{ x: number; y: number; z: number; blockType: string }> };
+  sessionOrigin?: { x: number; y: number; z: number };
+  isNewSession?: boolean;
+  buildNumber?: number;
 }
 
 interface FailedRoundLog {
@@ -270,6 +362,7 @@ interface FailedRoundLog {
   prompt: string;
   pos: { x: number; y: number; z: number };
   error: unknown;
+  userMessage?: string;
 }
 
 async function writeRoundLog(log: RoundLog): Promise<void> {
@@ -278,15 +371,25 @@ async function writeRoundLog(log: RoundLog): Promise<void> {
   const filename = `${ts}_${log.playerName}.md`;
   const filepath = join(LOG_DIR, filename);
 
+  const sessionInfo = log.sessionOrigin
+    ? `- **Session Origin:** x=${log.sessionOrigin.x}, y=${log.sessionOrigin.y}, z=${log.sessionOrigin.z}\n- **New Session:** ${log.isNewSession ? "Yes" : "No"}\n- **Build #:** ${log.buildNumber ?? "?"}`
+    : "";
+
   const md = `# Build Round - ${now.toLocaleString()}
 
 ## Player
 - **Name:** ${log.playerName}
 - **Position:** x=${log.pos.x}, y=${log.pos.y}, z=${log.pos.z}
+${sessionInfo}
 
-## User Prompt
+## User Prompt (original)
 \`\`\`
 ${log.prompt}
+\`\`\`
+
+## Full User Message (sent to Gemini)
+\`\`\`
+${log.userMessage}
 \`\`\`
 
 ## System Prompt
@@ -341,9 +444,14 @@ async function writeFailedRoundLog(log: FailedRoundLog): Promise<void> {
 - **Name:** ${log.playerName}
 - **Position:** x=${log.pos.x}, y=${log.pos.y}, z=${log.pos.z}
 
-## User Prompt
+## User Prompt (original)
 \`\`\`
 ${log.prompt}
+\`\`\`
+
+## Full User Message (sent to Gemini)
+\`\`\`
+${log.userMessage ?? "(not available)"}
 \`\`\`
 
 ## Error
