@@ -1,17 +1,25 @@
 import "dotenv/config";
 import { WebSocketServer } from "ws";
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import minecraftData from "minecraft-data";
 import { MinecraftHandler } from "./ws-handler.js";
-import { initGemini, generateBlueprint } from "./gemini.js";
+import {
+  BlueprintGenerationError,
+  initGemini,
+  generateBlueprint,
+  setSupportedBlockCatalog,
+} from "./gemini.js";
 
-// ── Config ─────────────────────────────────────────────────────────────
+// -- Config ------------------------------------------------------------------
 
 const PORT = Number(process.env.PORT) || 8000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE) || 5;
 const LOG_DIR = join(import.meta.dirname, "..", "logs");
+const FAILED_LOG_DIR = join(LOG_DIR, "failed");
+const BP_MANIFEST_PATH = join(import.meta.dirname, "..", "..", "packs", "BP", "manifest.json");
 
 if (!GEMINI_API_KEY) {
   console.error("ERROR: GEMINI_API_KEY not set in .env");
@@ -20,10 +28,14 @@ if (!GEMINI_API_KEY) {
 
 initGemini(GEMINI_API_KEY, GEMINI_MODEL);
 
-// Ensure logs directory exists
+// Ensure log directories exist
 await mkdir(LOG_DIR, { recursive: true });
+await mkdir(FAILED_LOG_DIR, { recursive: true });
 
-// ── WebSocket Server ───────────────────────────────────────────────────
+// Load block catalog from minecraft-data
+await loadBlockCatalogFromMinecraftData();
+
+// -- WebSocket Server --------------------------------------------------------
 
 const wss = new WebSocketServer({ port: PORT });
 console.log(`[Server] Listening on ws://localhost:${PORT}`);
@@ -34,7 +46,6 @@ wss.on("connection", (ws) => {
 
   const mc = new MinecraftHandler(ws);
 
-  // Subscribe to chat messages
   mc.subscribe("PlayerMessage");
 
   mc.on("PlayerMessage", (body: Record<string, unknown>) => {
@@ -42,7 +53,7 @@ wss.on("connection", (ws) => {
     const type = body.type as string | undefined;
     if (type !== "chat") return;
 
-    const message = (body.message as string) ?? "";
+    const message = typeof body.message === "string" ? body.message : "";
     const sender = (body.sender as string) ?? "";
 
     if (!message.startsWith("!ai ")) return;
@@ -68,7 +79,137 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ── Build Request Handler ──────────────────────────────────────────────
+// -- Block Catalog -----------------------------------------------------------
+
+interface BPManifestDependency {
+  module_name?: string;
+  version?: string;
+}
+
+interface BPManifest {
+  header?: {
+    min_engine_version?: number[];
+  };
+  dependencies?: BPManifestDependency[];
+}
+
+interface RuntimeVersionInfo {
+  scriptApiVersion: string | null;
+  minEngineVersion: string | null;
+}
+
+async function loadBlockCatalogFromMinecraftData(): Promise<void> {
+  const runtime = await readRuntimeVersionInfo();
+  const requestedVersion = (
+    process.env.MINECRAFT_DATA_VERSION?.trim() || runtime.minEngineVersion || ""
+  );
+
+  if (!requestedVersion) {
+    console.warn("[Catalog] Could not detect min_engine_version and MINECRAFT_DATA_VERSION is not set; keeping fallback catalog");
+    return;
+  }
+
+  const resolvedVersion = resolveBedrockDataVersion(requestedVersion);
+  if (!resolvedVersion) {
+    console.warn(`[Catalog] minecraft-data has no compatible Bedrock data for requested version ${requestedVersion}; keeping fallback catalog`);
+    return;
+  }
+
+  try {
+    const data = minecraftData(`bedrock_${resolvedVersion}`);
+    const blocks = data?.blocksArray ?? [];
+    const blockIds = blocks
+      .map((b) => String(b?.name ?? "").trim())
+      .filter((name) => name.length > 0)
+      .map((name) => name.startsWith("minecraft:") ? name : `minecraft:${name}`);
+
+    if (!blockIds.length) {
+      console.warn(`[Catalog] minecraft-data returned no blocks for bedrock_${resolvedVersion}; keeping fallback catalog`);
+      return;
+    }
+
+    setSupportedBlockCatalog(blockIds, {
+      version: resolvedVersion,
+      source: "minecraft-data",
+    });
+
+    console.log(
+      `[Catalog] Loaded minecraft-data bedrock version=${resolvedVersion} blockTypes=${blockIds.length} (manifest min_engine_version=${runtime.minEngineVersion ?? "unknown"}, script_api=${runtime.scriptApiVersion ?? "unknown"})`,
+    );
+  } catch (err) {
+    console.warn(
+      `[Catalog] Failed to load minecraft-data for bedrock_${resolvedVersion}; keeping fallback catalog: ${(err as Error).message}`,
+    );
+  }
+}
+
+async function readRuntimeVersionInfo(): Promise<RuntimeVersionInfo> {
+  try {
+    const raw = await readFile(BP_MANIFEST_PATH, "utf-8");
+    const manifest = JSON.parse(raw) as BPManifest;
+
+    const dep = Array.isArray(manifest.dependencies)
+      ? manifest.dependencies.find((d) => d.module_name === "@minecraft/server")
+      : undefined;
+
+    const scriptApiVersion = typeof dep?.version === "string" ? dep.version.trim() : "";
+    const minEngineParts = manifest.header?.min_engine_version;
+    const minEngineVersion = Array.isArray(minEngineParts) && minEngineParts.length >= 2
+      ? minEngineParts.map((v) => Number(v) || 0).join(".")
+      : "";
+
+    return {
+      scriptApiVersion: scriptApiVersion || null,
+      minEngineVersion: minEngineVersion || null,
+    };
+  } catch (err) {
+    console.warn(`[Catalog] Failed to read BP manifest: ${(err as Error).message}`);
+    return { scriptApiVersion: null, minEngineVersion: null };
+  }
+}
+
+function resolveBedrockDataVersion(requested: string): string | null {
+  const supported = minecraftData.supportedVersions.bedrock;
+  if (!supported.length) return null;
+
+  if (supported.includes(requested)) {
+    return requested;
+  }
+
+  const requestedPrefix = versionPrefix(requested);
+  const candidates = supported.filter((v) => versionPrefix(v) === requestedPrefix);
+  if (candidates.length) {
+    return candidates.sort(compareVersionDesc)[0];
+  }
+
+  return null;
+}
+
+function versionPrefix(version: string): string {
+  const parts = version.split(".").map((p) => Number.parseInt(p, 10)).filter((n) => Number.isFinite(n));
+  if (parts.length >= 2) {
+    return `${parts[0]}.${parts[1]}`;
+  }
+  return version;
+}
+
+function compareVersionDesc(a: string, b: string): number {
+  const aa = a.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const bb = b.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const len = Math.max(aa.length, bb.length);
+
+  for (let i = 0; i < len; i += 1) {
+    const av = aa[i] ?? 0;
+    const bv = bb[i] ?? 0;
+    if (av !== bv) {
+      return bv - av;
+    }
+  }
+
+  return 0;
+}
+
+// -- Build Request Handler ---------------------------------------------------
 
 async function handleBuildRequest(
   mc: MinecraftHandler,
@@ -83,7 +224,20 @@ async function handleBuildRequest(
 
   // 2. Generate blueprint via Gemini
   mc.tellraw(playerName, "§e[AI] Generating blueprint...");
-  const result = await generateBlueprint(prompt);
+
+  let result;
+  try {
+    result = await generateBlueprint(prompt);
+  } catch (err) {
+    await writeFailedRoundLog({
+      playerName,
+      prompt,
+      pos,
+      error: err,
+    });
+    throw err;
+  }
+
   const { blueprint, rawResponse, systemPrompt } = result;
   console.log(`[Gemini] Generated ${blueprint.blocks.length} blocks`);
 
@@ -100,7 +254,7 @@ async function handleBuildRequest(
   console.log("[Build] scriptevent(s) sent");
 }
 
-// ── Round Logging ──────────────────────────────────────────────────────
+// -- Round Logging -----------------------------------------------------------
 
 interface RoundLog {
   playerName: string;
@@ -111,13 +265,20 @@ interface RoundLog {
   blueprint: { blocks: Array<{ x: number; y: number; z: number; blockType: string }> };
 }
 
+interface FailedRoundLog {
+  playerName: string;
+  prompt: string;
+  pos: { x: number; y: number; z: number };
+  error: unknown;
+}
+
 async function writeRoundLog(log: RoundLog): Promise<void> {
   const now = new Date();
   const ts = now.toISOString().replace(/[:.]/g, "-");
   const filename = `${ts}_${log.playerName}.md`;
   const filepath = join(LOG_DIR, filename);
 
-  const md = `# Build Round — ${now.toLocaleString()}
+  const md = `# Build Round - ${now.toLocaleString()}
 
 ## Player
 - **Name:** ${log.playerName}
@@ -146,4 +307,66 @@ ${log.blueprint.blocks.map((b, i) => `| ${i + 1} | ${b.x} | ${b.y} | ${b.z} | ${
 
   await writeFile(filepath, md, "utf-8");
   console.log(`[Log] Saved ${filepath}`);
+}
+
+async function writeFailedRoundLog(log: FailedRoundLog): Promise<void> {
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:.]/g, "-");
+  const filename = `${ts}_${log.playerName}_failed.md`;
+  const filepath = join(FAILED_LOG_DIR, filename);
+
+  let errorType = "Error";
+  let errorPhase = "unknown";
+  let errorMessage = "Unknown error";
+  let systemPrompt = "";
+  let rawResponse = "";
+  let stack = "";
+
+  if (log.error instanceof BlueprintGenerationError) {
+    errorType = log.error.name;
+    errorPhase = log.error.phase;
+    errorMessage = log.error.message;
+    systemPrompt = log.error.systemPrompt;
+    rawResponse = log.error.rawResponse ?? "";
+    stack = log.error.stack ?? "";
+  } else if (log.error instanceof Error) {
+    errorType = log.error.name;
+    errorMessage = log.error.message;
+    stack = log.error.stack ?? "";
+  }
+
+  const md = `# Failed Build Round - ${now.toLocaleString()}
+
+## Player
+- **Name:** ${log.playerName}
+- **Position:** x=${log.pos.x}, y=${log.pos.y}, z=${log.pos.z}
+
+## User Prompt
+\`\`\`
+${log.prompt}
+\`\`\`
+
+## Error
+- **Type:** ${errorType}
+- **Phase:** ${errorPhase}
+- **Message:** ${errorMessage}
+
+## System Prompt
+\`\`\`
+${systemPrompt}
+\`\`\`
+
+## Gemini Raw Response (Unparsed)
+\`\`\`text
+${rawResponse}
+\`\`\`
+
+## Stack
+\`\`\`text
+${stack}
+\`\`\`
+`;
+
+  await writeFile(filepath, md, "utf-8");
+  console.log(`[Log] Saved failed round ${filepath}`);
 }

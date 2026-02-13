@@ -144,7 +144,7 @@ export class MinecraftHandler {
     const t = targets[0];
     return {
       x: Math.floor(t.position.x),
-      y: Math.floor(t.position.y),
+      y: Math.floor(t.position.y - 1), // Adjust Y to get the block the player is standing on
       z: Math.floor(t.position.z),
       dimension: t.dimension,
     };
