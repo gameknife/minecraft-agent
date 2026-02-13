@@ -59,6 +59,7 @@ GEMINI_API_KEY=your_api_key_here
 GEMINI_MODEL=gemini-2.0-flash
 PORT=8000
 CHUNK_SIZE=5
+PROMPT_BLOCK_TYPE_LIMIT=0
 ```
 
 ### 3. 构建行为包
@@ -118,6 +119,7 @@ MC_AGENT/
 | `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini 模型 |
 | `PORT` | `8000` | WebSocket 服务端口 |
 | `CHUNK_SIZE` | `5` | 每个 scriptevent 包含的方块数 |
+| `PROMPT_BLOCK_TYPE_LIMIT` | `0` | system prompt 中 blockType palette 上限；`0` 表示不裁剪 |
 
 ## Limitations (MVP)
 

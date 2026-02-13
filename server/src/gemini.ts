@@ -1,10 +1,11 @@
 import { GoogleGenAI } from "@google/genai";
 import type { Blueprint, Block } from "./ws-handler.js";
 
-const MAX_BLOCKS = 2000;
-const MAX_EXECUTED_STEPS = 5_000;
+const MAX_BLOCKS = 10_000;
+const MAX_EXECUTED_STEPS = 50_000;
 const MAX_CALL_DEPTH = 24;
 const MAX_CALLS = 500;
+const DEFAULT_PROMPT_BLOCK_TYPE_LIMIT = 0;
 
 const DEFAULT_BLOCK_TYPE = "minecraft:stone";
 const DEFAULT_ALLOWED_BLOCK_TYPES = [
@@ -763,17 +764,36 @@ Runtime block catalog constraints:
 }
 
 function selectPaletteForPrompt(): string[] {
+  const promptBlockTypeLimit = getPromptBlockTypeLimit();
   const preferred: string[] = [];
+  const preferredSet = new Set<string>();
   for (const id of DEFAULT_ALLOWED_BLOCK_TYPES) {
     if (supportedBlockTypes.has(id)) {
       preferred.push(id);
+      preferredSet.add(id);
     }
   }
 
-  if (preferred.length >= 24) {
-    return preferred.slice(0, 24);
+  const extra = [...supportedBlockTypes].filter((id) => !preferredSet.has(id));
+  const palette = [...preferred, ...extra];
+
+  if (promptBlockTypeLimit <= 0) {
+    return palette;
   }
 
-  const extra = [...supportedBlockTypes].slice(0, Math.max(0, 24 - preferred.length));
-  return [...preferred, ...extra];
+  return palette.slice(0, promptBlockTypeLimit);
+}
+
+function getPromptBlockTypeLimit(): number {
+  const raw = process.env.PROMPT_BLOCK_TYPE_LIMIT?.trim();
+  if (!raw) {
+    return DEFAULT_PROMPT_BLOCK_TYPE_LIMIT;
+  }
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_PROMPT_BLOCK_TYPE_LIMIT;
+  }
+
+  return parsed;
 }
