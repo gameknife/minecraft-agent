@@ -98,7 +98,14 @@ Coordinate system:
 Multi-turn building:
 - You may receive follow-up instructions referring to previous builds.
 - Each response must be a complete, valid JSON blueprint.
-- To remove blocks, place "minecraft:air" at those coordinates.`;
+- To remove blocks, place "minecraft:air" at those coordinates.
+
+Player manual block edits:
+- The user message may include "Player's manual block edits" listing blocks the player placed or broke by hand.
+- Incorporate these edits into your understanding of the current build state.
+- Build upon player-placed structures (e.g., if player built a foundation, build a house on top).
+- Respect broken blocks (openings, removed sections) unless the player asks otherwise.
+- Do NOT re-place blocks the player intentionally broke.`;
 
 let client: GoogleGenAI | null = null;
 let modelName = "gemini-2.0-flash";

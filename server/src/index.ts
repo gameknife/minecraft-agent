@@ -21,6 +21,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE) || 5;
 const SESSION_TIMEOUT = Number(process.env.SESSION_TIMEOUT) || 30 * 60 * 1000;
 const ORIGIN_DRIFT_THRESHOLD = Number(process.env.ORIGIN_DRIFT_THRESHOLD) || 100;
+const MANUAL_BLOCK_LIMIT = Number(process.env.MANUAL_BLOCK_LIMIT) || 200;
 const LOG_DIR = join(import.meta.dirname, "..", "logs");
 const FAILED_LOG_DIR = join(LOG_DIR, "failed");
 const BP_MANIFEST_PATH = join(import.meta.dirname, "..", "..", "packs", "BP", "manifest.json");
@@ -39,7 +40,7 @@ await mkdir(FAILED_LOG_DIR, { recursive: true });
 // Load block catalog from minecraft-data
 await loadBlockCatalogFromMinecraftData();
 
-const sessionManager = new SessionManager(SESSION_TIMEOUT);
+const sessionManager = new SessionManager(SESSION_TIMEOUT, MANUAL_BLOCK_LIMIT);
 
 // Periodically clean expired sessions
 setInterval(() => sessionManager.cleanExpired(), 60_000);
@@ -58,12 +59,36 @@ wss.on("connection", (ws) => {
   mc.subscribe("PlayerMessage");
 
   mc.on("PlayerMessage", (body: Record<string, unknown>) => {
+    const message = typeof body.message === "string" ? body.message : "";
+    const sender = (body.sender as string) ?? "";
+
+    // Intercept __BLOCK__: messages from behavior pack (manual block edits)
+    // These arrive as type "tell" via player.runCommandAsync('tell @s ...')
+    const blockMarker = "__BLOCK__:";
+    const blockIdx = message.indexOf(blockMarker);
+    if (blockIdx !== -1) {
+      try {
+        const json = JSON.parse(message.slice(blockIdx + blockMarker.length));
+        const recorded = sessionManager.recordManualBlock(
+          json.player,
+          json.x,
+          json.y,
+          json.z,
+          json.action,
+          json.blockType,
+        );
+        if (recorded) {
+          console.log(`[Block] ${json.player} ${json.action}d ${json.blockType} at (${json.x}, ${json.y}, ${json.z})`);
+        }
+      } catch {
+        // Ignore malformed __BLOCK__ messages
+      }
+      return;
+    }
+
     // Filter: only handle real chat messages (not tellraw echoes)
     const type = body.type as string | undefined;
     if (type !== "chat") return;
-
-    const message = typeof body.message === "string" ? body.message : "";
-    const sender = (body.sender as string) ?? "";
 
     if (!message.startsWith("!ai ")) return;
 
@@ -289,6 +314,12 @@ async function handleBuildRequest(
       (b, i) => `  ${i + 1}. "${b.prompt}" (${b.blockCount} blocks)`,
     );
     userMessage += `\n\nPrevious builds in this session:\n${historyLines.join("\n")}`;
+  }
+
+  // Include manual block edits
+  const manualBlocksContext = sessionManager.formatManualBlocks(playerName);
+  if (manualBlocksContext) {
+    userMessage += `\n\n${manualBlocksContext}`;
   }
 
   userMessage += `\n\nRequest: ${prompt}`;
