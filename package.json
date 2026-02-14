@@ -1,0 +1,13 @@
+{
+  "name": "mc-agent",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "regolith run",
+    "watch": "regolith watch"
+  },
+  "devDependencies": {
+    "@minecraft/server": "^2.5.0",
+    "esbuild": "^0.21.0"
+  }
+}
