@@ -31,6 +31,15 @@ type EventCallback = (body: Record<string, unknown>) => void;
 
 // ── Minecraft WS Handler ───────────────────────────────────────────────
 
+export interface ManualEditRaw {
+  player: string;
+  action: "place" | "break";
+  x: number;
+  y: number;
+  z: number;
+  blockType: string;
+}
+
 export class MinecraftHandler {
   private ws: WebSocket;
   private pending = new Map<
@@ -38,6 +47,10 @@ export class MinecraftHandler {
     { resolve: (v: CommandResponse) => void; reject: (e: Error) => void }
   >();
   private listeners = new Map<string, EventCallback[]>();
+  private pendingEditsResolve: {
+    resolve: (edits: ManualEditRaw[]) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
   constructor(ws: WebSocket) {
     this.ws = ws;
@@ -181,6 +194,36 @@ export class MinecraftHandler {
         await sleep(150);
       }
     }
+  }
+
+  /** Request manual block edits from the behavior pack. */
+  requestManualEdits(playerName: string, timeout = 3000): Promise<ManualEditRaw[]> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingEditsResolve = null;
+        resolve([]);
+      }, timeout);
+
+      this.pendingEditsResolve = {
+        resolve: (edits) => {
+          clearTimeout(timer);
+          this.pendingEditsResolve = null;
+          resolve(edits);
+        },
+        timer,
+      };
+
+      this.sendCommand(`/scriptevent ai:get_edits ${playerName}`);
+    });
+  }
+
+  /** Resolve a pending manual edits request. Returns true if there was a pending request. */
+  resolveManualEdits(edits: ManualEditRaw[]): boolean {
+    if (this.pendingEditsResolve) {
+      this.pendingEditsResolve.resolve(edits);
+      return true;
+    }
+    return false;
   }
 
   /** Send a tellraw message to a player. */

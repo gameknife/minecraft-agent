@@ -21,7 +21,6 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE) || 5;
 const SESSION_TIMEOUT = Number(process.env.SESSION_TIMEOUT) || 30 * 60 * 1000;
 const ORIGIN_DRIFT_THRESHOLD = Number(process.env.ORIGIN_DRIFT_THRESHOLD) || 100;
-const MANUAL_BLOCK_LIMIT = Number(process.env.MANUAL_BLOCK_LIMIT) || 200;
 const LOG_DIR = join(import.meta.dirname, "..", "logs");
 const FAILED_LOG_DIR = join(LOG_DIR, "failed");
 const BP_MANIFEST_PATH = join(import.meta.dirname, "..", "..", "packs", "BP", "manifest.json");
@@ -40,7 +39,7 @@ await mkdir(FAILED_LOG_DIR, { recursive: true });
 // Load block catalog from minecraft-data
 await loadBlockCatalogFromMinecraftData();
 
-const sessionManager = new SessionManager(SESSION_TIMEOUT, MANUAL_BLOCK_LIMIT);
+const sessionManager = new SessionManager(SESSION_TIMEOUT);
 
 // Periodically clean expired sessions
 setInterval(() => sessionManager.cleanExpired(), 60_000);
@@ -62,26 +61,15 @@ wss.on("connection", (ws) => {
     const message = typeof body.message === "string" ? body.message : "";
     const sender = (body.sender as string) ?? "";
 
-    // Intercept __BLOCK__: messages from behavior pack (manual block edits)
-    // These arrive as type "tell" via player.runCommandAsync('tell @s ...')
-    const blockMarker = "__BLOCK__:";
-    const blockIdx = message.indexOf(blockMarker);
-    if (blockIdx !== -1) {
+    // Intercept __EDITS__: batch responses from behavior pack (pull model)
+    const editsMarker = "__EDITS__:";
+    const editsIdx = message.indexOf(editsMarker);
+    if (editsIdx !== -1) {
       try {
-        const json = JSON.parse(message.slice(blockIdx + blockMarker.length));
-        const recorded = sessionManager.recordManualBlock(
-          json.player,
-          json.x,
-          json.y,
-          json.z,
-          json.action,
-          json.blockType,
-        );
-        if (recorded) {
-          console.log(`[Block] ${json.player} ${json.action}d ${json.blockType} at (${json.x}, ${json.y}, ${json.z})`);
-        }
+        const edits = JSON.parse(message.slice(editsIdx + editsMarker.length));
+        mc.resolveManualEdits(edits);
       } catch {
-        // Ignore malformed __BLOCK__ messages
+        // Ignore malformed __EDITS__ messages
       }
       return;
     }
@@ -98,9 +86,12 @@ wss.on("connection", (ws) => {
     console.log(`[Chat] ${sender}: !ai ${prompt}`);
 
     // Handle special commands
-    if (prompt === "reset") {
-      sessionManager.resetSession(sender);
-      mc.tellraw(sender, "§a[AI] Session reset. Next build will start a new session.");
+    if (prompt === "new") {
+      // Create a new session at current position
+      handleNewSession(mc, sender).catch((err) => {
+        console.error("[Error]", err);
+        mc.tellraw(sender, `§c[AI] Error: ${(err as Error).message}`);
+      });
       return;
     }
 
@@ -109,8 +100,17 @@ wss.on("connection", (ws) => {
       if (info) {
         mc.tellraw(sender, `§e[AI] Session: ${info}`);
       } else {
-        mc.tellraw(sender, "§e[AI] No active session.");
+        mc.tellraw(sender, "§e[AI] No active session. Use \"!ai new\" to start one.");
       }
+      return;
+    }
+
+    // Require active session
+    if (!sessionManager.getSession(sender)) {
+      mc.tellraw(
+        sender,
+        "§e[AI] No active session. Use \"!ai new\" to start a session at your current position, then build!",
+      );
       return;
     }
 
@@ -263,6 +263,22 @@ function compareVersionDesc(a: string, b: string): number {
 
 // -- Build Request Handler ---------------------------------------------------
 
+async function handleNewSession(
+  mc: MinecraftHandler,
+  playerName: string,
+): Promise<void> {
+  const pos = await mc.queryPlayerPosition(playerName);
+  sessionManager.resetSession(playerName);
+  const { chat, systemPrompt } = createChatSession();
+  sessionManager.createSession(playerName, pos, chat, systemPrompt);
+  console.log(`[Session] New session for ${playerName}, origin=(${pos.x}, ${pos.y}, ${pos.z})`);
+  mc.tellraw(
+    playerName,
+    `§a[AI] New session started at (${pos.x}, ${pos.y}, ${pos.z}). ` +
+    `Place blocks manually, then use "!ai <description>" to build!`,
+  );
+}
+
 async function handleBuildRequest(
   mc: MinecraftHandler,
   playerName: string,
@@ -274,60 +290,73 @@ async function handleBuildRequest(
   const currentPos = await mc.queryPlayerPosition(playerName);
   console.log(`[Pos] ${playerName} at (${currentPos.x}, ${currentPos.y}, ${currentPos.z})`);
 
-  // 2. Get or create session
-  let session = sessionManager.getSession(playerName);
-  const isNewSession = !session;
-  const sessionOrigin = session?.origin ?? currentPos;
+  // 2. Get session (must exist — checked before calling)
+  const session = sessionManager.getSession(playerName)!;
 
-  if (isNewSession) {
-    const { chat, systemPrompt } = createChatSession();
-    session = sessionManager.createSession(playerName, sessionOrigin, chat, systemPrompt);
-    console.log(`[Session] New session for ${playerName}, origin=(${sessionOrigin.x}, ${sessionOrigin.y}, ${sessionOrigin.z})`);
-  } else {
-    // Check drift
-    const dx = currentPos.x - session!.origin.x;
-    const dz = currentPos.z - session!.origin.z;
-    const drift = Math.sqrt(dx * dx + dz * dz);
-    if (drift > ORIGIN_DRIFT_THRESHOLD) {
-      mc.tellraw(
-        playerName,
-        `§6[AI] Warning: You are ${Math.floor(drift)} blocks from session origin. ` +
-        `Coordinates may be inaccurate. Use "!ai reset" to start a new session at your current location.`,
-      );
-    }
+  // Check drift
+  const dx = currentPos.x - session.origin.x;
+  const dz = currentPos.z - session.origin.z;
+  const drift = Math.sqrt(dx * dx + dz * dz);
+  if (drift > ORIGIN_DRIFT_THRESHOLD) {
+    mc.tellraw(
+      playerName,
+      `§6[AI] Warning: You are ${Math.floor(drift)} blocks from session origin. ` +
+      `Coordinates may be inaccurate. Use "!ai new" to start a new session at your current location.`,
+    );
   }
 
-  // 3. Build user message
+  // 3. Pull manual block edits from BP (only edits since last request)
+  const rawEdits = await mc.requestManualEdits(playerName);
+  if (rawEdits.length > 0) {
+    console.log(`[Block] Received ${rawEdits.length} manual edits for ${playerName}`);
+  }
+
+  // 4. Build user message
   mc.tellraw(playerName, "§e[AI] Generating blueprint...");
 
   const relativePos = {
-    x: currentPos.x - session!.origin.x,
-    y: currentPos.y - session!.origin.y,
-    z: currentPos.z - session!.origin.z,
+    x: currentPos.x - session.origin.x,
+    y: currentPos.y - session.origin.y,
+    z: currentPos.z - session.origin.z,
   };
 
   let userMessage = `Player is currently at relative position (${relativePos.x}, ${relativePos.y}, ${relativePos.z}).`;
 
   // Include build history summary
-  if (session!.builds.length > 0) {
-    const historyLines = session!.builds.map(
+  if (session.builds.length > 0) {
+    const historyLines = session.builds.map(
       (b, i) => `  ${i + 1}. "${b.prompt}" (${b.blockCount} blocks)`,
     );
     userMessage += `\n\nPrevious builds in this session:\n${historyLines.join("\n")}`;
   }
 
-  // Include manual block edits
-  const manualBlocksContext = sessionManager.formatManualBlocks(playerName);
-  if (manualBlocksContext) {
-    userMessage += `\n\n${manualBlocksContext}`;
+  // Include manual block edits (only changes since last request)
+  if (rawEdits.length > 0) {
+    const origin = session.origin;
+    const placed: string[] = [];
+    const broken: string[] = [];
+    for (const e of rawEdits) {
+      const rx = e.x - origin.x;
+      const ry = e.y - origin.y;
+      const rz = e.z - origin.z;
+      if (e.action === "place") {
+        placed.push(`  (${rx},${ry},${rz}) ${e.blockType}`);
+      } else {
+        broken.push(`  (${rx},${ry},${rz}) was ${e.blockType}`);
+      }
+    }
+    let editsContext = "Player's manual block edits since last request (relative coordinates):";
+    if (placed.length > 0) editsContext += `\nPlaced blocks:\n${placed.join("\n")}`;
+    if (broken.length > 0) editsContext += `\nBroken blocks:\n${broken.join("\n")}`;
+    userMessage += `\n\n${editsContext}`;
   }
 
   userMessage += `\n\nRequest: ${prompt}`;
 
-  // 4. Send to Gemini via Chat API
+  // 5. Send to Gemini via Chat API
   let result;
   try {
-    result = await sendChatMessage(session!.chat, userMessage, session!.systemPrompt);
+    result = await sendChatMessage(session.chat, userMessage, session.systemPrompt);
   } catch (err) {
     await writeFailedRoundLog({
       playerName,
@@ -342,14 +371,14 @@ async function handleBuildRequest(
   const { blueprint, rawResponse, systemPrompt } = result;
   console.log(`[Gemini] Generated ${blueprint.blocks.length} blocks`);
 
-  // 5. Record build in session
-  session!.builds.push({
+  // 6. Record build in session
+  session.builds.push({
     prompt,
     blockCount: blueprint.blocks.length,
     timestamp: Date.now(),
   });
 
-  // 6. Write round log
+  // 7. Write round log
   await writeRoundLog({
     playerName,
     prompt,
@@ -358,17 +387,17 @@ async function handleBuildRequest(
     systemPrompt,
     rawResponse,
     blueprint,
-    sessionOrigin: session!.origin,
-    isNewSession,
-    buildNumber: session!.builds.length,
+    sessionOrigin: session.origin,
+    isNewSession: false,
+    buildNumber: session.builds.length,
   });
 
-  // 7. Send build command using SESSION ORIGIN (not current pos)
+  // 8. Send build command using SESSION ORIGIN (not current pos)
   mc.tellraw(
     playerName,
     `§a[AI] Building ${blueprint.blocks.length} blocks...`,
   );
-  await mc.sendBuildCommand(session!.origin, blueprint, CHUNK_SIZE);
+  await mc.sendBuildCommand(session.origin, blueprint, CHUNK_SIZE);
 
   console.log("[Build] scriptevent(s) sent");
 }

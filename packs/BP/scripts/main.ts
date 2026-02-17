@@ -18,6 +18,30 @@ interface BuildPayload {
 const buildProgress = new Map<string, { placed: number; failed: number; total: number }>();
 
 system.afterEvents.scriptEventReceive.subscribe((event) => {
+  if (event.id === "ai:get_edits") {
+    try {
+      const playerName = event.message.trim();
+      // Collect edits for this player
+      const edits: ManualEdit[] = [];
+      for (let i = manualEditBuffer.length - 1; i >= 0; i--) {
+        if (manualEditBuffer[i].player === playerName) {
+          edits.push(manualEditBuffer[i]);
+          manualEditBuffer.splice(i, 1);
+        }
+      }
+      edits.reverse(); // restore chronological order
+      // Send response via /tell (one message per !ai request)
+      const players = world.getPlayers({ name: playerName });
+      if (players.length > 0) {
+        const response = JSON.stringify(edits);
+        players[0].runCommand(`tell @s §8__EDITS__:${response}`);
+      }
+    } catch (e) {
+      world.sendMessage(`§c[Debug] ai:get_edits error: ${e}`);
+    }
+    return;
+  }
+
   if (event.id !== "ai:build") return;
 
   let payload: BuildPayload;
@@ -90,20 +114,35 @@ function* placeBlocks(
 
 // -- Track player manual block edits ------------------------------------------
 
+interface ManualEdit {
+  player: string;
+  action: string;
+  x: number;
+  y: number;
+  z: number;
+  blockType: string;
+}
+
+const MAX_EDIT_BUFFER = 200;
+const manualEditBuffer: ManualEdit[] = [];
+
+function pushEdit(edit: ManualEdit): void {
+  if (manualEditBuffer.length >= MAX_EDIT_BUFFER) {
+    manualEditBuffer.shift(); // drop oldest
+  }
+  manualEditBuffer.push(edit);
+}
+
 world.afterEvents.playerPlaceBlock.subscribe((event) => {
   try {
-    const block = event.block;
-    const player = event.player;
-    const msg = JSON.stringify({
-      player: player.name,
+    pushEdit({
+      player: event.player.name,
       action: "place",
-      x: block.location.x,
-      y: block.location.y,
-      z: block.location.z,
-      blockType: block.typeId,
+      x: event.block.location.x,
+      y: event.block.location.y,
+      z: event.block.location.z,
+      blockType: event.block.typeId,
     });
-    // Use /tell so it triggers the WS PlayerMessage event (world.sendMessage does not)
-    player.runCommand(`tell @s §8__BLOCK__:${msg}`);
   } catch {
     // Silently ignore to avoid crashing the script engine
   }
@@ -111,18 +150,14 @@ world.afterEvents.playerPlaceBlock.subscribe((event) => {
 
 world.afterEvents.playerBreakBlock.subscribe((event) => {
   try {
-    const player = event.player;
-    const brokenType = event.brokenBlockPermutation.type.id;
-    const block = event.block; // now air, but has location
-    const msg = JSON.stringify({
-      player: player.name,
+    pushEdit({
+      player: event.player.name,
       action: "break",
-      x: block.location.x,
-      y: block.location.y,
-      z: block.location.z,
-      blockType: brokenType,
+      x: event.block.location.x,
+      y: event.block.location.y,
+      z: event.block.location.z,
+      blockType: event.brokenBlockPermutation.type.id,
     });
-    player.runCommand(`tell @s §8__BLOCK__:${msg}`);
   } catch {
     // Silently ignore to avoid crashing the script engine
   }

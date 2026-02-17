@@ -46,7 +46,7 @@ Prerequisites: Node.js >= 18, [Regolith](https://bedrock-oss.github.io/regolith/
 
 ### Server (`server/src/`)
 
-- **`index.ts`** — Entry point. WS server setup, `PlayerMessage` listener, build orchestration with session lifecycle, terrain scanning, Chat API integration, `!ai reset/status` commands, round logging (success logs to `server/logs/`, failures to `server/logs/failed/`). Loads block catalog from `minecraft-data` using BP manifest's `min_engine_version`.
+- **`index.ts`** — Entry point. WS server setup, `PlayerMessage` listener, build orchestration with session lifecycle, terrain scanning, Chat API integration, `!ai new/status` commands, manual block edit pull (`ai:get_edits` scriptevent), round logging (success logs to `server/logs/`, failures to `server/logs/failed/`). Loads block catalog from `minecraft-data` using BP manifest's `min_engine_version`.
 - **`ws-handler.ts`** — `MinecraftHandler` class wrapping the Minecraft WS protocol. Handles command request/response correlation via UUIDs, event subscriptions, `/querytarget` parsing, `/scriptevent` chunking, `/tellraw` messaging, terrain scan command/collection (`ai:scan` + `__SCAN__` message interception).
 - **`gemini.ts`** — Gemini API integration. Supports both stateless `generateBlueprint()` and multi-turn `createChatSession()` + `sendChatMessage()`. Builds system prompt with compact DSL spec + block palette + terrain context. Contains `formatTerrainContext()` for scan data formatting. Full expression parser/evaluator for compact program format.
 - **`session.ts`** — `SessionManager` class. Per-player sessions with locked origin, Chat object, build history, and auto-expiry.
@@ -110,8 +110,8 @@ Local esbuild filter (`runWith: "nodejs"`). Compiles `main.ts` → `main.js` (ES
 
 ## In-Game Commands
 
-- `!ai <prompt>` — Build something. Creates a session on first use, subsequent calls are multi-turn.
-- `!ai reset` — Reset session. Clears conversation history, next build starts fresh at current position.
+- `!ai new` — Start a new session at current position. Required before first build. Clears any previous session.
+- `!ai <prompt>` — Build something. Requires an active session (use `!ai new` first). Pulls manual block edits since last request.
 - `!ai status` — Show session info (origin, build count, idle time).
 
 ## Session & Coordinate System
@@ -119,7 +119,7 @@ Local esbuild filter (`runWith: "nodejs"`). Compiles `main.ts` → `main.js` (ES
 - **Session origin** is locked to the player's position on the first `!ai` call.
 - All LLM coordinates are relative to the session origin, so follow-up builds ("add a door", "extend the wall") reference the same coordinate space.
 - `sendBuildCommand` uses session origin, not the player's current position.
-- If the player moves > `ORIGIN_DRIFT_THRESHOLD` blocks, they get a warning to `!ai reset`.
+- If the player moves > `ORIGIN_DRIFT_THRESHOLD` blocks, they get a warning to `!ai new`.
 - Sessions auto-expire after `SESSION_TIMEOUT` (default 30 min) of inactivity.
 - All sessions are cleared on WS disconnect.
 

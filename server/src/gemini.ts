@@ -101,11 +101,13 @@ Multi-turn building:
 - To remove blocks, place "minecraft:air" at those coordinates.
 
 Player manual block edits:
-- The user message may include "Player's manual block edits" listing blocks the player placed or broke by hand.
-- Incorporate these edits into your understanding of the current build state.
-- Build upon player-placed structures (e.g., if player built a foundation, build a house on top).
-- Respect broken blocks (openings, removed sections) unless the player asks otherwise.
-- Do NOT re-place blocks the player intentionally broke.`;
+- The user message may include "Player's manual block edits since last request" with coordinates and block types.
+- These are only changes since the last request — earlier edits are already in conversation history.
+- CRITICAL: Use manually placed blocks as positional anchors. If the player placed corner blocks forming a rectangle, build WITHIN that exact bounding box. If they placed a row of blocks, extend or build along that line.
+- Analyze the pattern: corner markers define boundaries, lines define walls/edges, filled areas define floors/foundations.
+- Your build coordinates MUST align with the manually placed blocks, not ignore them.
+- Preserve manually placed blocks — do not replace them unless the build requires a different block type at that position.
+- Respect broken blocks (openings, cleared areas) — do NOT re-place blocks the player intentionally broke.`;
 
 let client: GoogleGenAI | null = null;
 let modelName = "gemini-2.0-flash";
