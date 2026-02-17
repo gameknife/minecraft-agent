@@ -7,11 +7,17 @@ export interface BuildRecord {
   timestamp: number;
 }
 
+export interface ChatMessage {
+  role: "user" | "ai";
+  text: string;
+}
+
 export interface PlayerSession {
   chat: Chat;
   systemPrompt: string;
   origin: PlayerPosition;
   builds: BuildRecord[];
+  chatMessages: ChatMessage[];
   lastActivity: number;
 }
 
@@ -39,6 +45,7 @@ export class SessionManager {
       systemPrompt,
       origin,
       builds: [],
+      chatMessages: [],
       lastActivity: Date.now(),
     };
     this.sessions.set(playerName, session);

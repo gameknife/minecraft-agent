@@ -29,11 +29,20 @@ const DEFAULT_ALLOWED_BLOCK_TYPES = [
   "minecraft:torch",
 ] as const;
 
-const BASE_SYSTEM_PROMPT = `You are a Minecraft Bedrock Edition building assistant.
-Given a building description, output a JSON object in one of these formats:
+const BASE_SYSTEM_PROMPT = `You are a Minecraft Bedrock Edition AI assistant that can both chat and build.
+All responses MUST be a JSON object with a "type" field.
+
+Response types:
+
+1. Chat response (answering questions, general conversation, help):
+{ "type": "chat", "message": "Your reply text here" }
+
+2. Build response (when the player asks to build/construct/modify structures):
 
 Preferred compact format (use this when there is repetition):
 {
+  "type": "build",
+  "message": "Brief description of what you're building",
   "defs": [
     {
       "name": "functionName",
@@ -50,8 +59,10 @@ Preferred compact format (use this when there is repetition):
   ]
 }
 
-Legacy format (allowed):
+Legacy build format (allowed):
 {
+  "type": "build",
+  "message": "Brief description",
   "blocks": [{"x":0,"y":0,"z":0,"blockType":"minecraft:stone"}]
 }
 
@@ -78,14 +89,16 @@ Rules:
   - No trailing commas
   - No duplicate top-level keys
   - Exactly one top-level object, not multiple JSON objects
-- Do NOT add helper keys like "comment", "note", "explanation", "reason", "summary".
+- Do NOT add helper keys like "comment", "note", "explanation", "reason", "summary" (except "message" and "type").
 - Every item in "steps" must be an executable op object (place/block/for/call).
 - Make structures that look good and are architecturally sound.
 - For a "house" or "hut", include walls, a floor, a door opening, and a roof.
 - For a "platform", create a flat surface at y=0.
 - Prefer defs + loops + calls instead of listing one block per line when possible.
 - if blockType is minecraft:air, skip it
-- If you cannot satisfy all requirements, still return valid JSON with a smaller build.`;
+- If you cannot satisfy all requirements, still return valid JSON with a smaller build.
+- For non-building questions (Minecraft knowledge, redstone, tips, general chat), use type "chat".
+- Keep chat messages concise and helpful. Use plain text, not markdown.`;
 
 const MULTI_TURN_PROMPT_ADDITIONS = `
 
@@ -121,11 +134,22 @@ export function initGemini(apiKey: string, model?: string): void {
   if (model) modelName = model;
 }
 
-export interface GeminiResult {
+export interface GeminiBuildResult {
+  type: "build";
+  message?: string;
   blueprint: Blueprint;
   rawResponse: string;
   systemPrompt: string;
 }
+
+export interface GeminiChatResult {
+  type: "chat";
+  message: string;
+  rawResponse: string;
+  systemPrompt: string;
+}
+
+export type GeminiResult = GeminiBuildResult | GeminiChatResult;
 
 type BlueprintErrorPhase =
   | "api_request"
@@ -222,9 +246,19 @@ export async function generateBlueprint(prompt: string): Promise<GeminiResult> {
     }
 
     try {
-      const blocks = parseBlocksFromResponse(data);
+      const parsed = parseResponse(data);
+      if (parsed.type === "chat") {
+        return {
+          type: "chat",
+          message: parsed.message!,
+          rawResponse: text,
+          systemPrompt,
+        };
+      }
       return {
-        blueprint: { blocks },
+        type: "build",
+        message: parsed.message,
+        blueprint: { blocks: parsed.blocks! },
         rawResponse: text,
         systemPrompt,
       };
@@ -318,9 +352,19 @@ export async function sendChatMessage(
     }
 
     try {
-      const blocks = parseBlocksFromResponse(data);
+      const parsed = parseResponse(data);
+      if (parsed.type === "chat") {
+        return {
+          type: "chat",
+          message: parsed.message!,
+          rawResponse: text,
+          systemPrompt,
+        };
+      }
       return {
-        blueprint: { blocks },
+        type: "build",
+        message: parsed.message,
+        blueprint: { blocks: parsed.blocks! },
         rawResponse: text,
         systemPrompt,
       };
@@ -362,33 +406,54 @@ interface ExecBudget {
   calls: number;
 }
 
-function parseBlocksFromResponse(raw: unknown): Block[] {
+interface ParsedResponse {
+  type: "chat" | "build";
+  message?: string;
+  blocks?: Block[];
+}
+
+function parseResponse(raw: unknown): ParsedResponse {
   if (!isRecord(raw)) {
     throw new Error("Gemini response must be a JSON object");
   }
+
+  // Check for explicit chat type
+  if (raw.type === "chat") {
+    const message = typeof raw.message === "string" ? raw.message : "";
+    if (!message) {
+      throw new Error("Chat response missing message field");
+    }
+    return { type: "chat", message };
+  }
+
+  // Build type (explicit or inferred from blocks/steps/defs)
+  const buildMessage = typeof raw.message === "string" ? raw.message : undefined;
 
   const hasCompactProgram =
     Array.isArray(raw.steps) || Array.isArray(raw.defs);
 
   if (hasCompactProgram) {
     try {
-      return expandCompactProgram(raw).slice(0, MAX_BLOCKS);
+      const blocks = expandCompactProgram(raw).slice(0, MAX_BLOCKS);
+      return { type: "build", message: buildMessage, blocks };
     } catch (err) {
       if (Array.isArray(raw.blocks)) {
         console.warn(
           `[Gemini] Compact program parse failed, falling back to legacy blocks: ${(err as Error).message}`,
         );
-        return normalizeLegacyBlocks(raw.blocks).slice(0, MAX_BLOCKS);
+        const blocks = normalizeLegacyBlocks(raw.blocks).slice(0, MAX_BLOCKS);
+        return { type: "build", message: buildMessage, blocks };
       }
       throw err;
     }
   }
 
   if (Array.isArray(raw.blocks)) {
-    return normalizeLegacyBlocks(raw.blocks).slice(0, MAX_BLOCKS);
+    const blocks = normalizeLegacyBlocks(raw.blocks).slice(0, MAX_BLOCKS);
+    return { type: "build", message: buildMessage, blocks };
   }
 
-  throw new Error("Gemini response missing steps/defs or blocks");
+  throw new Error("Gemini response missing type/steps/defs/blocks");
 }
 
 function expandCompactProgram(program: Record<string, unknown>): Block[] {

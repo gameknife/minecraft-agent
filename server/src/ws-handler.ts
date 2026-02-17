@@ -232,6 +232,77 @@ export class MinecraftHandler {
     this.sendCommand(`/tellraw ${playerName} ${escaped}`);
   }
 
+  /** Send a chat response to the behavior pack for UI display.
+   *  Automatically chunks long messages to stay within the scriptevent
+   *  message‐size limit (~2048 chars).  Each chunk is sent as a separate
+   *  scriptevent with chunk/totalChunks fields so the BP can reassemble.
+   */
+  async sendChatResponse(
+    playerName: string,
+    message: string,
+    type: "chat" | "build",
+    blockCount?: number,
+  ): Promise<void> {
+    const maxResponseLen = Number(process.env.CHAT_MAX_RESPONSE_LENGTH) || 1500;
+    let text = message;
+    if (text.length > maxResponseLen) {
+      text = text.slice(0, maxResponseLen) + "...";
+    }
+
+    // Estimate safe chunk size for the *message* portion.
+    // JSON overhead (keys, playerName, type, chunk indices) ≈ 120 chars.
+    // scriptevent prefix "/scriptevent ai:chat_response " = 30 chars.
+    // JSON‐escaping can roughly double some characters (\n → \\n, " → \\").
+    // Use 600 raw chars per chunk as a conservative limit.
+    const CHUNK_RAW_LIMIT = 600;
+
+    if (text.length <= CHUNK_RAW_LIMIT) {
+      // Fits in a single scriptevent
+      const payload = JSON.stringify({
+        playerName,
+        message: text,
+        type,
+        ...(blockCount !== undefined && { blockCount }),
+      });
+      this.sendCommand(`/scriptevent ai:chat_response ${payload}`);
+      return;
+    }
+
+    // Split into chunks
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += CHUNK_RAW_LIMIT) {
+      chunks.push(text.slice(i, i + CHUNK_RAW_LIMIT));
+    }
+
+    for (let i = 0; i < chunks.length; i++) {
+      const payload = JSON.stringify({
+        playerName,
+        message: chunks[i],
+        type,
+        chunk: i,
+        totalChunks: chunks.length,
+        ...(blockCount !== undefined && { blockCount }),
+      });
+      this.sendCommand(`/scriptevent ai:chat_response ${payload}`);
+      if (i < chunks.length - 1) {
+        await sleep(100);
+      }
+    }
+  }
+
+  /** Summon an NPC near a player via scriptevent. */
+  summonNPC(playerName: string, pos: { x: number; y: number; z: number }): void {
+    const npcName = process.env.NPC_NAME || "AI助手";
+    const payload = JSON.stringify({
+      playerName,
+      x: pos.x + 2,
+      y: pos.y,
+      z: pos.z,
+      name: npcName,
+    });
+    this.sendCommand(`/scriptevent ai:summon_npc ${payload}`);
+  }
+
   // ── Internal ──
 
   private handleMessage(raw: string): void {

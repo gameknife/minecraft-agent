@@ -46,10 +46,10 @@ Prerequisites: Node.js >= 18, [Regolith](https://bedrock-oss.github.io/regolith/
 
 ### Server (`server/src/`)
 
-- **`index.ts`** — Entry point. WS server setup, `PlayerMessage` listener, build orchestration with session lifecycle, terrain scanning, Chat API integration, `!ai new/status` commands, manual block edit pull (`ai:get_edits` scriptevent), round logging (success logs to `server/logs/`, failures to `server/logs/failed/`). Loads block catalog from `minecraft-data` using BP manifest's `min_engine_version`.
-- **`ws-handler.ts`** — `MinecraftHandler` class wrapping the Minecraft WS protocol. Handles command request/response correlation via UUIDs, event subscriptions, `/querytarget` parsing, `/scriptevent` chunking, `/tellraw` messaging, terrain scan command/collection (`ai:scan` + `__SCAN__` message interception).
-- **`gemini.ts`** — Gemini API integration. Supports both stateless `generateBlueprint()` and multi-turn `createChatSession()` + `sendChatMessage()`. Builds system prompt with compact DSL spec + block palette + terrain context. Contains `formatTerrainContext()` for scan data formatting. Full expression parser/evaluator for compact program format.
-- **`session.ts`** — `SessionManager` class. Per-player sessions with locked origin, Chat object, build history, and auto-expiry.
+- **`index.ts`** — Entry point. WS server setup, `PlayerMessage` listener, build orchestration with session lifecycle, terrain scanning, Chat API integration, `!ai new/status` commands, manual block edit pull (`ai:get_edits` scriptevent), NPC chat handling (`__CHAT__:` message interception + `handleChatMessage()`), NPC auto-summon on first connection, round logging (success logs to `server/logs/`, failures to `server/logs/failed/`). Loads block catalog from `minecraft-data` using BP manifest's `min_engine_version`.
+- **`ws-handler.ts`** — `MinecraftHandler` class wrapping the Minecraft WS protocol. Handles command request/response correlation via UUIDs, event subscriptions, `/querytarget` parsing, `/scriptevent` chunking, `/tellraw` messaging, terrain scan command/collection (`ai:scan` + `__SCAN__` message interception). Also provides `sendChatResponse()` and `summonNPC()` methods.
+- **`gemini.ts`** — Gemini API integration. Supports both stateless `generateBlueprint()` and multi-turn `createChatSession()` + `sendChatMessage()`. Builds system prompt with compact DSL spec + block palette + terrain context. Contains `formatTerrainContext()` for scan data formatting. Full expression parser/evaluator for compact program format. Returns unified `GeminiResult` type discriminated by `type: "chat" | "build"`.
+- **`session.ts`** — `SessionManager` class. Per-player sessions with locked origin, Chat object, build history, chat message history, and auto-expiry.
 
 ### Compact Blueprint DSL (in `gemini.ts`)
 
@@ -62,13 +62,20 @@ Gemini can return a mini-program instead of flat block lists. The server-side in
 
 ### Behavior Pack (`packs/BP/scripts/main.ts`)
 
-Single file. Handles two scriptevents:
+Single file. Uses `@minecraft/server` and `@minecraft/server-ui`. Handles scriptevents:
 - `ai:build` — parses JSON payload, uses `system.runJob` generator to place blocks one-per-tick via `block.setType()`. Tracks multi-chunk build progress.
 - `ai:scan` — scans a 3D region around a center point, filters air blocks, sends non-air block data back to server via `world.sendMessage("§8__SCAN__:...")` in chunks of 50 blocks.
+- `ai:chat_response` — receives AI reply from server, stores in chat history, auto-reopens NPC form.
+- `ai:summon_npc` — spawns an NPC entity with a given name at specified coordinates.
+
+Also provides NPC interaction UI:
+- Right-clicking the AI NPC opens an `ActionFormData` showing chat history with buttons (Send Message, New Session, Status).
+- "Send Message" opens a `ModalFormData` text input; submitted messages are sent to the server via `tell @s §8__CHAT__:JSON`.
+- Native NPC dialog is cancelled via `beforeEvents.playerInteractWithEntity`.
 
 ### Regolith Build (`data/ts_compiler/`)
 
-Local esbuild filter (`runWith: "nodejs"`). Compiles `main.ts` → `main.js` (ESM, es2020 target), externalizes `@minecraft/server`, strips `.ts` files from output.
+Local esbuild filter (`runWith: "nodejs"`). Compiles `main.ts` → `main.js` (ESM, es2020 target), externalizes `@minecraft/server` and `@minecraft/server-ui`, strips `.ts` files from output.
 
 ## Critical Pitfalls
 
@@ -107,12 +114,16 @@ Local esbuild filter (`runWith: "nodejs"`). Compiles `main.ts` → `main.js` (ES
 | `SCAN_TIMEOUT` | `15000` | Scan timeout (ms) |
 | `SESSION_TIMEOUT` | `1800000` | Session inactivity timeout (30min, ms) |
 | `ORIGIN_DRIFT_THRESHOLD` | `100` | Distance warning threshold (blocks) |
+| `NPC_NAME` | `AI助手` | Display name for the AI NPC entity |
+| `NPC_AUTO_SUMMON` | `true` | Auto-summon NPC near player on connect |
+| `CHAT_MAX_RESPONSE_LENGTH` | `1500` | Max chars for AI reply sent to BP UI |
 
 ## In-Game Commands
 
-- `!ai new` — Start a new session at current position. Required before first build. Clears any previous session.
+- `!ai new` — Start a new session at current position. Required before first build via chat. Clears any previous session.
 - `!ai <prompt>` — Build something. Requires an active session (use `!ai new` first). Pulls manual block edits since last request.
 - `!ai status` — Show session info (origin, build count, idle time).
+- **Right-click AI NPC** — Opens a form UI for chatting and building. Sessions are auto-created. Supports both free-form Q&A and build requests.
 
 ## Session & Coordinate System
 

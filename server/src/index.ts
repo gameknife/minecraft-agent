@@ -21,6 +21,8 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE) || 5;
 const SESSION_TIMEOUT = Number(process.env.SESSION_TIMEOUT) || 30 * 60 * 1000;
 const ORIGIN_DRIFT_THRESHOLD = Number(process.env.ORIGIN_DRIFT_THRESHOLD) || 100;
+const NPC_AUTO_SUMMON = (process.env.NPC_AUTO_SUMMON ?? "true") !== "false";
+const NPC_NAME = process.env.NPC_NAME || "AI助手";
 const LOG_DIR = join(import.meta.dirname, "..", "logs");
 const FAILED_LOG_DIR = join(LOG_DIR, "failed");
 const BP_MANIFEST_PATH = join(import.meta.dirname, "..", "..", "packs", "BP", "manifest.json");
@@ -57,7 +59,26 @@ wss.on("connection", (ws) => {
 
   mc.subscribe("PlayerMessage");
 
+  // Auto-summon NPC near player after connection
+  let npcSummoned = false;
+
   mc.on("PlayerMessage", (body: Record<string, unknown>) => {
+    // Auto-summon NPC on first chat message from any player
+    if (NPC_AUTO_SUMMON && !npcSummoned) {
+      const firstSender = (body.sender as string) ?? "";
+      if (firstSender) {
+        npcSummoned = true;
+        mc.queryPlayerPosition(firstSender)
+          .then((pos) => {
+            mc.summonNPC(firstSender, pos);
+            console.log(`[NPC] Auto-summoned "${NPC_NAME}" near ${firstSender} at (${pos.x + 2}, ${pos.y}, ${pos.z})`);
+          })
+          .catch((err) => {
+            console.warn(`[NPC] Failed to auto-summon: ${(err as Error).message}`);
+            npcSummoned = false; // retry on next message
+          });
+      }
+    }
     const message = typeof body.message === "string" ? body.message : "";
     const sender = (body.sender as string) ?? "";
 
@@ -70,6 +91,27 @@ wss.on("connection", (ws) => {
         mc.resolveManualEdits(edits);
       } catch {
         // Ignore malformed __EDITS__ messages
+      }
+      return;
+    }
+
+    // Intercept __CHAT__: messages from NPC UI
+    const chatMarker = "__CHAT__:";
+    const chatIdx = message.indexOf(chatMarker);
+    if (chatIdx !== -1) {
+      try {
+        const chatData = JSON.parse(message.slice(chatIdx + chatMarker.length));
+        const chatPlayerName = chatData.playerName ?? sender;
+        const chatMessage = chatData.message ?? "";
+        if (chatMessage) {
+          console.log(`[NPC Chat] ${chatPlayerName}: ${chatMessage}`);
+          handleChatMessage(mc, chatPlayerName, chatMessage).catch((err) => {
+            console.error("[Error]", err);
+            mc.tellraw(chatPlayerName, `§c[AI] Error: ${(err as Error).message}`);
+          });
+        }
+      } catch {
+        // Ignore malformed __CHAT__ messages
       }
       return;
     }
@@ -124,6 +166,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     console.log("[Server] Minecraft client disconnected");
     sessionManager.clearAll();
+    npcSummoned = false;
   });
 
   ws.on("error", (err) => {
@@ -368,7 +411,18 @@ async function handleBuildRequest(
     throw err;
   }
 
-  const { blueprint, rawResponse, systemPrompt } = result;
+  const { rawResponse, systemPrompt } = result;
+
+  // Handle chat-only response from !ai command
+  if (result.type === "chat") {
+    console.log(`[Gemini] Chat response for build request: ${result.message.slice(0, 80)}`);
+    mc.tellraw(playerName, `§b[AI] ${result.message}`);
+    session.chatMessages.push({ role: "user", text: prompt });
+    session.chatMessages.push({ role: "ai", text: result.message });
+    return;
+  }
+
+  const { blueprint } = result;
   console.log(`[Gemini] Generated ${blueprint.blocks.length} blocks`);
 
   // 6. Record build in session
@@ -393,13 +447,140 @@ async function handleBuildRequest(
   });
 
   // 8. Send build command using SESSION ORIGIN (not current pos)
-  mc.tellraw(
-    playerName,
-    `§a[AI] Building ${blueprint.blocks.length} blocks...`,
-  );
+  const buildMsg = result.message
+    ? `§a[AI] ${result.message} (${blueprint.blocks.length} blocks)`
+    : `§a[AI] Building ${blueprint.blocks.length} blocks...`;
+  mc.tellraw(playerName, buildMsg);
   await mc.sendBuildCommand(session.origin, blueprint, CHUNK_SIZE);
 
   console.log("[Build] scriptevent(s) sent");
+}
+
+// -- NPC Chat Handler --------------------------------------------------------
+
+async function handleChatMessage(
+  mc: MinecraftHandler,
+  playerName: string,
+  message: string,
+): Promise<void> {
+  // Handle special UI commands
+  if (message === "!ai_new") {
+    await handleNewSession(mc, playerName);
+    await mc.sendChatResponse(playerName, "New session started! You can start building now.", "chat");
+    return;
+  }
+
+  // 1. Get or create session (auto-create for NPC chat, no !ai new required)
+  let session = sessionManager.getSession(playerName);
+  if (!session) {
+    const pos = await mc.queryPlayerPosition(playerName);
+    const { chat, systemPrompt } = createChatSession();
+    session = sessionManager.createSession(playerName, pos, chat, systemPrompt);
+    console.log(`[Session] Auto-created session for ${playerName} via NPC chat, origin=(${pos.x}, ${pos.y}, ${pos.z})`);
+  }
+
+  // 2. Record user message
+  session.chatMessages.push({ role: "user", text: message });
+
+  // 3. Query player position for context
+  const currentPos = await mc.queryPlayerPosition(playerName);
+  const relativePos = {
+    x: currentPos.x - session.origin.x,
+    y: currentPos.y - session.origin.y,
+    z: currentPos.z - session.origin.z,
+  };
+
+  // 4. Pull manual block edits
+  const rawEdits = await mc.requestManualEdits(playerName);
+
+  // 5. Build user message with context
+  let userMessage = `Player is currently at relative position (${relativePos.x}, ${relativePos.y}, ${relativePos.z}).`;
+
+  if (session.builds.length > 0) {
+    const historyLines = session.builds.map(
+      (b, i) => `  ${i + 1}. "${b.prompt}" (${b.blockCount} blocks)`,
+    );
+    userMessage += `\n\nPrevious builds in this session:\n${historyLines.join("\n")}`;
+  }
+
+  if (rawEdits.length > 0) {
+    const origin = session.origin;
+    const placed: string[] = [];
+    const broken: string[] = [];
+    for (const e of rawEdits) {
+      const rx = e.x - origin.x;
+      const ry = e.y - origin.y;
+      const rz = e.z - origin.z;
+      if (e.action === "place") {
+        placed.push(`  (${rx},${ry},${rz}) ${e.blockType}`);
+      } else {
+        broken.push(`  (${rx},${ry},${rz}) was ${e.blockType}`);
+      }
+    }
+    let editsContext = "Player's manual block edits since last request (relative coordinates):";
+    if (placed.length > 0) editsContext += `\nPlaced blocks:\n${placed.join("\n")}`;
+    if (broken.length > 0) editsContext += `\nBroken blocks:\n${broken.join("\n")}`;
+    userMessage += `\n\n${editsContext}`;
+  }
+
+  userMessage += `\n\nRequest: ${message}`;
+
+  // 6. Send to Gemini
+  let result;
+  try {
+    result = await sendChatMessage(session.chat, userMessage, session.systemPrompt);
+  } catch (err) {
+    await writeFailedRoundLog({
+      playerName,
+      prompt: message,
+      pos: currentPos,
+      error: err,
+      userMessage,
+    });
+    // Send error to BP UI
+    await mc.sendChatResponse(playerName, `Error: ${(err as Error).message}`, "chat");
+    throw err;
+  }
+
+  // 7. Handle response based on type
+  if (result.type === "chat") {
+    console.log(`[Gemini] Chat reply to ${playerName}: ${result.message.slice(0, 80)}`);
+    session.chatMessages.push({ role: "ai", text: result.message });
+    await mc.sendChatResponse(playerName, result.message, "chat");
+  } else {
+    // Build response from NPC chat
+    const { blueprint, rawResponse, systemPrompt } = result;
+    console.log(`[Gemini] Build from NPC chat: ${blueprint.blocks.length} blocks`);
+
+    session.builds.push({
+      prompt: message,
+      blockCount: blueprint.blocks.length,
+      timestamp: Date.now(),
+    });
+
+    const buildMsg = result.message
+      ? `${result.message} (${blueprint.blocks.length} blocks)`
+      : `Building ${blueprint.blocks.length} blocks...`;
+    session.chatMessages.push({ role: "ai", text: buildMsg });
+
+    await writeRoundLog({
+      playerName,
+      prompt: message,
+      userMessage,
+      pos: currentPos,
+      systemPrompt,
+      rawResponse,
+      blueprint,
+      sessionOrigin: session.origin,
+      isNewSession: false,
+      buildNumber: session.builds.length,
+    });
+
+    await mc.sendChatResponse(playerName, buildMsg, "build", blueprint.blocks.length);
+    mc.tellraw(playerName, `§a[AI] ${buildMsg}`);
+    await mc.sendBuildCommand(session.origin, blueprint, CHUNK_SIZE);
+    console.log("[Build] scriptevent(s) sent via NPC chat");
+  }
 }
 
 // -- Round Logging -----------------------------------------------------------

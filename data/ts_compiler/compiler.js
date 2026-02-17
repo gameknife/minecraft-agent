@@ -18,7 +18,7 @@ esbuild.buildSync({
   bundle: true,
   outfile: path.join(scriptsDir, "main.js"),
   format: "esm",
-  external: ["@minecraft/server"],
+  external: ["@minecraft/server", "@minecraft/server-ui"],
   target: "es2020",
   sourcemap: true,
 });
